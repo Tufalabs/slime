@@ -25,24 +25,24 @@ micromamba install -n slime -c conda-forge cudnn -y
 pip install cmake ninja
 
 # reinstall sglang deps
-pip install git+https://github.com/fzyzcjy/torch_memory_saver.git --no-cache-dir --force-reinstall --no-build-isolation
+pip install /mnt/artifacts/kev_builds/torch_memory_saver-0.0.8-cp39-abi3-linux_x86_64.whl
 
 # install megatron deps
-TORCH_CUDA_ARCH_LIST="9.0;9.0a" \
+TORCH_CUDA_ARCH_LIST="10.0" GROUPED_GEMM_FORCE_BUILD=TRUE \
   pip -v install --no-build-isolation \
   git+https://github.com/fanshiqing/grouped_gemm@v1.1.4
 # apex
-TORCH_CUDA_ARCH_LIST="9.0;9.0a" NVCC_APPEND_FLAGS="--threads 4" \
+TORCH_CUDA_ARCH_LIST="10.0" NVCC_APPEND_FLAGS="--threads 4" \
 \
   pip -v install --disable-pip-version-check --no-cache-dir \
   --no-build-isolation \
   --config-settings "--build-option=--cpp_ext --cuda_ext --parallel 8" git+https://github.com/NVIDIA/apex.git
 # transformer engine
-TORCH_CUDA_ARCH_LIST="9.0;9.0a" \
+TORCH_CUDA_ARCH_LIST="10.0" \
   pip -v install transformer_engine[pytorch]
 # flash attn
 # the newest version megatron supports is v2.7.4.post1
-MAX_JOBS=64 pip -v install flash-attn==2.7.4.post1
+pip install /mnt/artifacts/kev_builds/flash_attn-2.7.4.post1-cp312-cp312-linux_x86_64.whl
 # megatron
 cd $BASE_DIR
 git clone https://github.com/NVIDIA/Megatron-LM.git
@@ -63,7 +63,7 @@ if [ ! -d "$BASE_DIR/slime" ]; then
   export SLIME_DIR=$BASE_DIR/slime
   pip install -e .
 else
-  export SLIME_DIR=$BASE_DIR/
+  export SLIME_DIR=$BASE_DIR/slime
   pip install -e .
 fi
 
