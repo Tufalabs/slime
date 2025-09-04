@@ -4,7 +4,7 @@ set -ex
 
 # create conda
 yes '' | "${SHELL}" <(curl -L micro.mamba.pm/install.sh)
-source ~/.bashrc
+eval "$(micromamba shell hook -s posix)"
 
 micromamba create -n slime python=3.12 pip -c conda-forge -y
 micromamba activate slime
@@ -12,6 +12,13 @@ export CUDA_HOME="$CONDA_PREFIX"
 
 export BASE_DIR=${BASE_DIR:-"/root"}
 cd $BASE_DIR
+
+# install basic deps
+pip install sglang-router
+pip install "ray[default]"
+pip install "httpx[http2]" wandb pylatexenc blobfile accelerate "mcp[cli]"
+pip install sgl-kernel==0.3.3 -i https://docs.sglang.ai/whl/cu128
+
 # install sglang
 git clone https://github.com/sgl-project/sglang.git
 cd sglang
@@ -25,7 +32,7 @@ micromamba install -n slime -c conda-forge cudnn -y
 pip install cmake ninja
 
 # reinstall sglang deps
-pip install /mnt/artifacts/kev_builds/torch_memory_saver-0.0.8-cp39-abi3-linux_x86_64.whl
+pip install /mnt/artifacts/kev_builds/torch_memory_saver-0.0.8-cp39-abi3-linux_x86_64.whl --force-reinstall
 
 # install megatron deps
 TORCH_CUDA_ARCH_LIST="10.0" GROUPED_GEMM_FORCE_BUILD=TRUE \
