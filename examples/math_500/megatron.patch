@@ -1,0 +1,850 @@
+diff --git a/megatron/core/distributed/__init__.py b/megatron/core/distributed/__init__.py
+index fe26e8b4..4451f277 100644
+--- a/megatron/core/distributed/__init__.py
++++ b/megatron/core/distributed/__init__.py
+@@ -11,3 +11,15 @@ from .finalize_model_grads import finalize_model_grads
+ from .fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+ from .torch_fully_sharded_data_parallel import TorchFullyShardedDataParallel
+ from .torch_fully_sharded_data_parallel_config import TorchFullyShardedDataParallelConfig
++
++# Backward compatibility patch for FSDP module reorganization
++import sys
++import importlib.util
++
++spec = importlib.util.find_spec('megatron.core.distributed.fsdp.src.megatron_fsdp')
++if spec:
++    custom_fsdp = importlib.util.module_from_spec(spec)
++    spec.loader.exec_module(custom_fsdp)
++    sys.modules['megatron.core.distributed.custom_fsdp'] = custom_fsdp
++    if hasattr(custom_fsdp, 'MegatronFSDP'):
++        custom_fsdp.FullyShardedDataParallel = custom_fsdp.MegatronFSDP
+diff --git a/megatron/core/extensions/transformer_engine.py b/megatron/core/extensions/transformer_engine.py
+index 99c3edc0..26ea5cb4 100644
+--- a/megatron/core/extensions/transformer_engine.py
++++ b/megatron/core/extensions/transformer_engine.py
+@@ -404,6 +404,7 @@ class TELinear(te.pytorch.Linear):
+         )
+ 
+         for param in self.parameters():
++            setattr(param, "parallel_mode", parallel_mode)
+             if is_expert:
+                 # Reduce the gradient on the expert_data_parallel group for expert linear layers
+                 setattr(param, "allreduce", not self.expert_parallel)
+diff --git a/megatron/core/models/gpt/gpt_layer_specs.py b/megatron/core/models/gpt/gpt_layer_specs.py
+index 002edb92..f7273488 100755
+--- a/megatron/core/models/gpt/gpt_layer_specs.py
++++ b/megatron/core/models/gpt/gpt_layer_specs.py
+@@ -80,6 +80,8 @@ def get_gpt_layer_with_transformer_engine_spec(
+     use_te_op_fuser: Optional[bool] = False,
+     use_kitchen: bool = False,
+     use_te_activation_func: bool = False,
++    post_self_attn_layernorm: bool = False,
++    post_mlp_layernorm: bool = False,
+ ) -> ModuleSpec:
+     """Use this spec to use lower-level Transformer Engine modules (required for fp8 training).
+ 
+@@ -182,9 +184,11 @@ def get_gpt_layer_with_transformer_engine_spec(
+                     ),
+                 ),
+                 self_attn_bda=get_bias_dropout_add,
++                post_self_attn_layernorm=TENorm if post_self_attn_layernorm else IdentityOp,
+                 pre_mlp_layernorm=backend.layer_norm() if num_experts else IdentityOp,
+                 mlp=mlp,
+                 mlp_bda=get_bias_dropout_add,
++                post_mlp_layernorm=TENorm if post_mlp_layernorm else IdentityOp,
+                 sharded_state_dict_keys_map={
+                     "mlp.0.weight": "mlp.linear_fc1.layer_norm_weight",
+                     "mlp.0.bias": "mlp.linear_fc1.layer_norm_bias",
+diff --git a/megatron/core/models/gpt/gpt_model.py b/megatron/core/models/gpt/gpt_model.py
+index df9adc3e..2f4f544a 100644
+--- a/megatron/core/models/gpt/gpt_model.py
++++ b/megatron/core/models/gpt/gpt_model.py
+@@ -443,7 +443,7 @@ class GPTModel(LanguageModule):
+         if self.share_embeddings_and_output_weights:
+             output_weight = self.shared_embedding_or_output_weight()
+ 
+-        if mtp_in_postprocess:
++        if mtp_in_postprocess and labels is not None:
+             hidden_states = self.mtp(
+                 input_ids=input_ids,
+                 position_ids=position_ids,
+diff --git a/megatron/core/parallel_state.py b/megatron/core/parallel_state.py
+index 57332ac3..f3abd642 100644
+--- a/megatron/core/parallel_state.py
++++ b/megatron/core/parallel_state.py
+@@ -9,6 +9,7 @@ from typing import Callable, List, Optional
+ 
+ import numpy as np
+ import torch
++import torch.distributed as dist
+ 
+ from .utils import GlobalMemoryBuffer, is_torch_min_version
+ 
+@@ -163,6 +164,213 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
+         return None
+ 
+ 
++old_new_group = None
++
++
++def monkey_patch_torch_dist():
++    print("Applying monkey patch to torch.distributed", flush=True)
++    global old_new_group
++    if old_new_group is not None:
++        return
++
++    old_new_group = dist.new_group
++
++    def new_group(*args, **kwargs):
++        group = old_new_group(*args, **kwargs)
++        # skip none nccl group.
++        if (
++            len(args) >= 3 and args[2] == "gloo" or
++            "backend" in kwargs and kwargs["backend"] == "gloo"
++        ):
++            return group
++        
++        # Get ranks from arguments
++        if len(args) >= 1 and args[0] is not None:
++            ranks = args[0]
++        elif "ranks" in kwargs and kwargs["ranks"] is not None:
++            ranks = kwargs["ranks"]
++        else:
++            # If no ranks specified, use all ranks in world
++            ranks = list(range(dist.get_world_size()))
++
++        if len(ranks) == 1:
++            return group
++
++        group = ReloadableProcessGroup(group, ranks)
++        return group
++
++    dist.new_group = new_group
++
++    def get_new_function(func):
++        def new_function(*args, **kwargs):
++            args = (
++                arg.group if isinstance(arg, ReloadableProcessGroup) else arg
++                for arg in args
++            )
++            kwargs = {
++                k: (v.group if isinstance(v, ReloadableProcessGroup) else v)
++                for k, v in kwargs.items()
++            }
++            return func(*args, **kwargs)
++        return new_function
++
++    dist.get_rank = get_new_function(dist.get_rank)
++    dist.get_world_size = get_new_function(dist.get_world_size)
++    dist.get_backend = get_new_function(dist.get_backend)
++    dist.get_global_rank = get_new_function(dist.get_global_rank)
++    dist.get_group_rank = get_new_function(dist.get_group_rank)
++    dist.get_process_group_ranks = get_new_function(dist.get_process_group_ranks)
++
++    dist.all_reduce = get_new_function(dist.all_reduce)
++    dist.all_gather = get_new_function(dist.all_gather)
++    dist.all_gather_into_tensor = get_new_function(dist.all_gather_into_tensor)
++    dist.all_gather_object = get_new_function(dist.all_gather_object)
++    dist.all_to_all = get_new_function(dist.all_to_all)
++    dist.all_to_all_single = get_new_function(dist.all_to_all_single)
++    dist.broadcast = get_new_function(dist.broadcast)
++    dist.reduce = get_new_function(dist.reduce)
++    dist.reduce_scatter = get_new_function(dist.reduce_scatter)
++    dist.reduce_scatter_tensor = get_new_function(dist.reduce_scatter_tensor)
++    dist.scatter = get_new_function(dist.scatter)
++    dist.gather = get_new_function(dist.gather)
++    dist.barrier = get_new_function(dist.barrier)
++    dist.send = get_new_function(dist.send)
++    dist.recv = get_new_function(dist.recv)
++    dist._coalescing_manager = get_new_function(dist._coalescing_manager)
++
++    # p2p
++    old_isend = dist.isend
++    old_irecv = dist.irecv
++
++    dist.isend = get_new_function(dist.isend)
++    dist.irecv = get_new_function(dist.irecv)
++
++    def get_new_p2pop_function(func):
++        def new_function(*args, **kwargs):
++            def convert(arg):
++                if isinstance(arg, ReloadableProcessGroup):
++                    return arg.group
++                elif arg == dist.isend:
++                    arg = old_isend
++                elif arg == dist.irecv:
++                    arg = old_irecv
++                return arg
++
++            args = (convert(arg) for arg in args)
++            kwargs = {
++                k: convert(v)
++                for k, v in kwargs.items()
++            }
++            return func(*args, **kwargs)
++        return new_function
++    
++    dist.P2POp.__new__ = get_new_p2pop_function(dist.P2POp.__new__)
++    dist.P2POp.__init__ = get_new_p2pop_function(dist.P2POp.__init__)
++
++
++
++class ReloadableProcessGroup(torch.distributed.ProcessGroup):
++    GROUPS = []
++
++    def __init__(self, group, ranks):
++        super().__init__(
++            rank=dist.get_rank(group),
++            size=dist.get_world_size(group),
++        )
++        #print(f"Creating ReloadableProcessGroup with ranks: {ranks}", flush=True)
++        self.group = group
++        self.group_info = {
++            "ranks": ranks,
++        }
++        ReloadableProcessGroup.GROUPS.append(self)
++
++    def __getattr__(self, name):
++        return getattr(self.group, name)
++
++    @staticmethod
++    def destroy_process_groups():
++        for reloadable_group in ReloadableProcessGroup.GROUPS:
++            if reloadable_group.group is None:
++                continue
++            #print(f"Destroying process group: {reloadable_group.group_info['ranks']}")
++            dist.destroy_process_group(reloadable_group.group)
++            del reloadable_group.group
++            reloadable_group.group = None
++
++    @staticmethod
++    def reload_process_groups():
++        for reloadable_group in ReloadableProcessGroup.GROUPS:
++            if reloadable_group.group is not None:
++                continue
++            #print(f"Reloading process group: {reloadable_group.group_info['ranks']}")
++            group = old_new_group(
++                ranks=reloadable_group.group_info["ranks"],
++                backend="nccl"
++            )
++            reloadable_group.group = group
++
++    def rank(self) -> int: return self.group.rank()
++    def size(self) -> int: return self.group.size()
++    def name(self) -> str: return self.group.name()
++
++    def shutdown(self) -> None:
++        if self.group is not None:
++            self.group.shutdown()
++
++    def abort(self) -> None:
++        if self.group is not None:
++            self.group.abort()
++
++    def _fwd(self, method, *args, **kwargs):
++        inner = self.group
++        if inner is None:
++            raise RuntimeError("ReloadableProcessGroup: inner PG is None, call reload() first.")
++        return getattr(inner, method)(*args, **kwargs)
++
++    def barrier(self, *a, **kw): return self._fwd("barrier", *a, **kw)
++    def broadcast(self, *a, **kw): return self._fwd("broadcast", *a, **kw)
++    def allreduce(self, *a, **kw): return self._fwd("allreduce", *a, **kw)
++    def allreduce_coalesced(self, *a, **kw): return self._fwd("allreduce_coalesced", *a, **kw)
++    def reduce(self, *a, **kw): return self._fwd("reduce", *a, **kw)
++    def allgather(self, *a, **kw): return self._fwd("allgather", *a, **kw)
++    def _allgather_base(self, *a, **kw): return self._fwd("_allgather_base", *a, **kw)
++    def allgather_coalesced(self, *a, **kw): return self._fwd("allgather_coalesced", *a, **kw)
++    def allgather_into_tensor_coalesced(self, *a, **kw): return self._fwd("allgather_into_tensor_coalesced", *a, **kw)
++    def gather(self, *a, **kw): return self._fwd("gather", *a, **kw)
++    def scatter(self, *a, **kw): return self._fwd("scatter", *a, **kw)
++    def reduce_scatter(self, *a, **kw): return self._fwd("reduce_scatter", *a, **kw)
++    def _reduce_scatter_base(self, *a, **kw): return self._fwd("_reduce_scatter_base", *a, **kw)
++    def reduce_scatter_tensor_coalesced(self, *a, **kw): return self._fwd("reduce_scatter_tensor_coalesced", *a, **kw)
++    def alltoall_base(self, *a, **kw): return self._fwd("alltoall_base", *a, **kw)
++    def alltoall(self, *a, **kw): return self._fwd("alltoall", *a, **kw)
++    def send(self, *a, **kw): return self._fwd("send", *a, **kw)
++    def recv(self, *a, **kw): return self._fwd("recv", *a, **kw)
++    def recv_anysource(self, *a, **kw): return self._fwd("recv_anysource", *a, **kw)
++
++    def _start_coalescing(self, *a, **kw): return self._fwd("_start_coalescing", *a, **kw)
++    def _end_coalescing(self, *a, **kw): return self._fwd("_end_coalescing", *a, **kw)
++    def _get_backend_name(self): return self._fwd("_get_backend_name")
++    def _get_backend(self, *a, **kw): return self._fwd("_get_backend", *a, **kw)
++    def _set_default_backend(self, *a, **kw): return self._fwd("_set_default_backend", *a, **kw)
++    @property
++    def bound_device_id(self): return self.group.bound_device_id
++    @bound_device_id.setter
++    def bound_device_id(self, dev): self.group.bound_device_id = dev
++
++
++def destroy_process_groups():
++    """Destroy all reloadable process groups."""
++    ReloadableProcessGroup.destroy_process_groups()
++
++
++def reload_process_groups():
++    """Reload all reloadable process groups."""
++    ReloadableProcessGroup.reload_process_groups()
++
++
++monkey_patch_torch_dist()
++
++
+ def create_group(
+     ranks=None,
+     timeout=None,
+diff --git a/megatron/core/pipeline_parallel/p2p_communication.py b/megatron/core/pipeline_parallel/p2p_communication.py
+index 63ee9d1f..b90b744c 100644
+--- a/megatron/core/pipeline_parallel/p2p_communication.py
++++ b/megatron/core/pipeline_parallel/p2p_communication.py
+@@ -26,22 +26,22 @@ def _batched_p2p_ops(
+     ops = []
+     if tensor_send_prev is not None:
+         send_prev_op = torch.distributed.P2POp(
+-            torch.distributed.isend, tensor_send_prev, prev_pipeline_rank, group
++            torch.distributed.isend, tensor_send_prev, prev_pipeline_rank,
+         )
+         ops.append(send_prev_op)
+     if tensor_recv_prev is not None:
+         recv_prev_op = torch.distributed.P2POp(
+-            torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank, group
++            torch.distributed.irecv, tensor_recv_prev, prev_pipeline_rank,
+         )
+         ops.append(recv_prev_op)
+     if tensor_send_next is not None:
+         send_next_op = torch.distributed.P2POp(
+-            torch.distributed.isend, tensor_send_next, next_pipeline_rank, group
++            torch.distributed.isend, tensor_send_next, next_pipeline_rank,
+         )
+         ops.append(send_next_op)
+     if tensor_recv_next is not None:
+         recv_next_op = torch.distributed.P2POp(
+-            torch.distributed.irecv, tensor_recv_next, next_pipeline_rank, group
++            torch.distributed.irecv, tensor_recv_next, next_pipeline_rank,
+         )
+         ops.append(recv_next_op)
+     if len(ops) > 0:
+diff --git a/megatron/core/transformer/attention.py b/megatron/core/transformer/attention.py
+index c749bac4..38eb1491 100644
+--- a/megatron/core/transformer/attention.py
++++ b/megatron/core/transformer/attention.py
+@@ -25,6 +25,7 @@ from megatron.core.parallel_state import (
+ from megatron.core.process_groups_config import ModelCommProcessGroups
+ from megatron.core.transformer.module import MegatronModule
+ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
++from megatron.core.transformer.tp_rmsnorm import TPRMSNorm
+ from megatron.core.utils import (
+     deprecate_inference_params,
+     divide,
+@@ -894,22 +895,46 @@ class SelfAttention(Attention):
+         )
+ 
+         if submodules.q_layernorm is not None:
+-            self.q_layernorm = build_module(
+-                submodules.q_layernorm,
+-                hidden_size=self.hidden_size_per_attention_head,
+-                config=self.config,
+-                eps=self.config.layernorm_epsilon,
+-            )
++            if config.qk_layernorm_unshare:
++                # Use TP-aware RMSNorm for unshared weights
++                # Total query projection size before TP sharding
++                self.q_layernorm = TPRMSNorm(
++                    config=self.config,
++                    hidden_size=self.query_projection_size,
++                    eps=self.config.layernorm_epsilon,
++                    tp_group=self.model_comm_pgs.tp,
++                )
++            else:
++                # Use shared weights RMSNorm (per-head normalization)
++                layernorm_size = self.hidden_size_per_attention_head
++                self.q_layernorm = build_module(
++                    submodules.q_layernorm,
++                    hidden_size=layernorm_size,
++                    config=self.config,
++                    eps=self.config.layernorm_epsilon,
++                )
+         else:
+             self.q_layernorm = None
+ 
+         if submodules.k_layernorm is not None:
+-            self.k_layernorm = build_module(
+-                submodules.k_layernorm,
+-                hidden_size=self.hidden_size_per_attention_head,
+-                config=self.config,
+-                eps=self.config.layernorm_epsilon,
+-            )
++            if config.qk_layernorm_unshare:
++                # Use TP-aware RMSNorm for unshared weights
++                # Total key projection size before TP sharding
++                self.k_layernorm = TPRMSNorm(
++                    config=self.config,
++                    hidden_size=self.kv_projection_size,
++                    eps=self.config.layernorm_epsilon,
++                    tp_group=self.model_comm_pgs.tp,
++                )
++            else:
++                # Use shared weights RMSNorm (per-head normalization)
++                layernorm_size = self.hidden_size_per_attention_head
++                self.k_layernorm = build_module(
++                    submodules.k_layernorm,
++                    hidden_size=layernorm_size,
++                    config=self.config,
++                    eps=self.config.layernorm_epsilon,
++                )
+         else:
+             self.k_layernorm = None
+ 
+@@ -928,17 +953,36 @@ class SelfAttention(Attention):
+         if not self.config.qk_layernorm:
+             return
+ 
++        # For TP-aware RMSNorm with unshared weights, weights are sharded
++        # so we skip the consistency check across TP ranks
++        if self.config.qk_layernorm_unshare:
++            return
++
+         # check that all tensor parallel and data parallel ranks have the same
+         # Q & K layernorm parameters.
+         rank = get_data_parallel_rank()
+-        inputs = torch.stack(
+-            [
+-                self.q_layernorm.weight.data,
+-                self.q_layernorm.bias.data,
+-                self.k_layernorm.weight.data,
+-                self.k_layernorm.bias.data,
+-            ]
+-        )
++
++        # Handle RMSNorm (no bias) vs LayerNorm (with bias)
++        has_bias = hasattr(self.q_layernorm, 'bias') and self.q_layernorm.bias is not None
++
++        if has_bias:
++            inputs = torch.stack(
++                [
++                    self.q_layernorm.weight.data,
++                    self.q_layernorm.bias.data,
++                    self.k_layernorm.weight.data,
++                    self.k_layernorm.bias.data,
++                ]
++            )
++        else:
++            # RMSNorm case - no bias
++            inputs = torch.stack(
++                [
++                    self.q_layernorm.weight.data,
++                    self.k_layernorm.weight.data,
++                ]
++            )
++
+         dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
+         dp_list[rank] = inputs
+         torch.distributed.all_gather(dp_list, inputs, group=get_data_parallel_group())
+@@ -952,18 +996,30 @@ class SelfAttention(Attention):
+                 )
+ 
+         for i, dp in enumerate(dp_list):
+-            q_w, q_b, k_w, k_b = torch.unbind(dp)
+-            _compare(
+-                [q_w, q_b, k_w, k_b],
+-                [
+-                    self.q_layernorm.weight.data,
+-                    self.q_layernorm.bias.data,
+-                    self.k_layernorm.weight.data,
+-                    self.k_layernorm.bias.data,
+-                ],
+-                ["q_w", "q_b", "k_w", "k_b"],
+-                "DP",
+-            )
++            if has_bias:
++                q_w, q_b, k_w, k_b = torch.unbind(dp)
++                _compare(
++                    [q_w, q_b, k_w, k_b],
++                    [
++                        self.q_layernorm.weight.data,
++                        self.q_layernorm.bias.data,
++                        self.k_layernorm.weight.data,
++                        self.k_layernorm.bias.data,
++                    ],
++                    ["q_w", "q_b", "k_w", "k_b"],
++                    "DP",
++                )
++            else:
++                q_w, k_w = torch.unbind(dp)
++                _compare(
++                    [q_w, k_w],
++                    [
++                        self.q_layernorm.weight.data,
++                        self.k_layernorm.weight.data,
++                    ],
++                    ["q_w", "k_w"],
++                    "DP",
++                )
+ 
+         rank = get_tensor_model_parallel_rank()
+         tp_list = [torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())]
+@@ -971,18 +1027,30 @@ class SelfAttention(Attention):
+         torch.distributed.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
+ 
+         for i, tp in enumerate(tp_list):
+-            q_w, q_b, k_w, k_b = torch.unbind(tp)
+-            _compare(
+-                [q_w, q_b, k_w, k_b],
+-                [
+-                    self.q_layernorm.weight.data,
+-                    self.q_layernorm.bias.data,
+-                    self.k_layernorm.weight.data,
+-                    self.k_layernorm.bias.data,
+-                ],
+-                ["q_w", "q_b", "k_w", "k_b"],
+-                "TP",
+-            )
++            if has_bias:
++                q_w, q_b, k_w, k_b = torch.unbind(tp)
++                _compare(
++                    [q_w, q_b, k_w, k_b],
++                    [
++                        self.q_layernorm.weight.data,
++                        self.q_layernorm.bias.data,
++                        self.k_layernorm.weight.data,
++                        self.k_layernorm.bias.data,
++                    ],
++                    ["q_w", "q_b", "k_w", "k_b"],
++                    "TP",
++                )
++            else:
++                q_w, k_w = torch.unbind(tp)
++                _compare(
++                    [q_w, k_w],
++                    [
++                        self.q_layernorm.weight.data,
++                        self.k_layernorm.weight.data,
++                    ],
++                    ["q_w", "k_w"],
++                    "TP",
++                )
+ 
+     def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
+         """
+@@ -1026,10 +1094,30 @@ class SelfAttention(Attention):
+         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+ 
+         if self.q_layernorm is not None:
+-            query = self.q_layernorm(query)
++            if self.config.qk_layernorm_unshare:
++                # Apply TP-aware normalization
++                # query shape: [sq, b, np, hn] where np is num_attention_heads_per_partition
++                # Reshape to [sq, b, np * hn] for normalization
++                sq, b, np, hn = query.shape
++                query = query.reshape(sq, b, np * hn)
++                query = self.q_layernorm(query)
++                query = query.reshape(sq, b, np, hn)
++            else:
++                # Standard per-head normalization
++                query = self.q_layernorm(query)
+ 
+         if self.k_layernorm is not None:
+-            key = self.k_layernorm(key)
++            if self.config.qk_layernorm_unshare:
++                # Apply TP-aware normalization
++                # key shape: [sq, b, ng, hn] where ng is num_query_groups_per_partition
++                # Reshape to [sq, b, ng * hn] for normalization
++                sq, b, ng, hn = key.shape
++                key = key.reshape(sq, b, ng * hn)
++                key = self.k_layernorm(key)
++                key = key.reshape(sq, b, ng, hn)
++            else:
++                # Standard per-head normalization
++                key = self.k_layernorm(key)
+ 
+         if self.config.test_mode:
+             self.run_realtime_tests()
+diff --git a/megatron/core/transformer/tp_rmsnorm.py b/megatron/core/transformer/tp_rmsnorm.py
+new file mode 100644
+index 00000000..d4ecb734
+--- /dev/null
++++ b/megatron/core/transformer/tp_rmsnorm.py
+@@ -0,0 +1,167 @@
++# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
++
++import torch
++import torch.nn as nn
++from typing import Optional, Tuple
++
++from megatron.core.dist_checkpointing.mapping import ShardedStateDict
++from megatron.core.jit import jit_fuser
++from megatron.core.parallel_state import get_tensor_model_parallel_group
++from megatron.core.tensor_parallel import reduce_from_tensor_model_parallel_region
++from megatron.core.tensor_parallel.layers import (
++    _initialize_affine_weight_cpu,
++    set_tensor_model_parallel_attributes,
++)
++from megatron.core.tensor_parallel.utils import divide
++from megatron.core.transformer import TransformerConfig
++from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
++from megatron.core.utils import get_pg_rank, get_pg_size
++
++
++class TPRMSNorm(nn.Module):
++    """
++    RMSNorm implementation for tensor-parallel QK normalization.
++
++    This implementation is designed for normalization of query and key tensors
++    that are sharded along the head dimension due to tensor parallelism.
++
++    The algorithm:
++    1. Compute local RMS statistics on the sharded input
++    2. All-reduce the statistics across TP ranks to get global RMS
++    3. Normalize using global RMS and apply sharded weight scaling
++
++    Args:
++        config: TransformerConfig with parallelism settings
++        hidden_size: Total hidden size (before TP sharding)
++        eps: Small value for numerical stability
++        tp_group: Tensor parallel process group
++    """
++
++    def __init__(
++        self,
++        config: TransformerConfig,
++        hidden_size: int,
++        eps: float = 1e-6,
++        tp_group: Optional[torch.distributed.ProcessGroup] = None,
++    ):
++        super().__init__()
++        self.config = config
++        self.eps = eps
++
++        # Get TP group and size
++        self.tp_group = tp_group or get_tensor_model_parallel_group()
++        self.tp_size = get_pg_size(self.tp_group)
++        self.tp_rank = get_pg_rank(self.tp_group)
++
++        # Calculate local hidden size (sharded)
++        self.hidden_size = hidden_size
++        self.local_hidden_size = divide(hidden_size, self.tp_size)
++
++        # Initialize sharded weight parameter
++        self.weight = nn.Parameter(torch.ones(self.local_hidden_size))
++
++        # Set tensor parallel attributes for the weight
++        set_tensor_model_parallel_attributes(
++            self.weight,
++            is_parallel=True,
++            dim=0,
++            stride=1
++        )
++
++        # Initialize weight if needed
++        if config.use_cpu_initialization:
++            self.weight.data = _initialize_affine_weight_cpu(
++                self.weight,
++                self.local_hidden_size,
++                self.local_hidden_size,
++                self.local_hidden_size,
++                init_method=lambda x: x.fill_(1.0),
++                params_dtype=config.params_dtype,
++                rank=self.tp_rank,
++                world_size=self.tp_size,
++            )
++
++    @jit_fuser
++    def _compute_local_rms_sq(self, x: torch.Tensor) -> torch.Tensor:
++        """Compute local squared RMS values."""
++        x_float = x.float()
++        # Compute mean of squares for local shard
++        local_mean_sq = x_float.pow(2).mean(dim=-1, keepdim=True)
++        return local_mean_sq
++
++    @jit_fuser
++    def _apply_normalization(
++        self,
++        x: torch.Tensor,
++        global_rms_inv: torch.Tensor
++    ) -> torch.Tensor:
++        """Apply normalization using global RMS and local weights."""
++        x_float = x.float()
++        # Normalize and apply sharded weight
++        normalized = x_float * global_rms_inv
++        weighted = normalized * self.weight
++        return weighted.type_as(x)
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        """
++        Forward pass with TP-aware RMS normalization.
++
++        Args:
++            x: Input tensor of shape [seq_len, batch, heads_per_rank, head_dim]
++               or [seq_len, batch, hidden_per_rank]
++
++        Returns:
++            Normalized tensor with same shape as input
++        """
++        input_shape = x.shape
++
++        # Reshape to [seq_len * batch * heads_per_rank, head_dim] if needed
++        if len(input_shape) == 4:
++            seq_len, batch, heads, head_dim = input_shape
++            x = x.reshape(seq_len * batch * heads, head_dim)
++            needs_reshape = True
++        else:
++            needs_reshape = False
++
++        # Step 1: Compute local RMS statistics (mean of squares)
++        local_mean_sq = self._compute_local_rms_sq(x)
++
++        # Step 2: All-reduce to get global mean of squares
++        # Since input is sharded, we need to average across TP ranks
++        if self.tp_size > 1:
++            # Sum local statistics using Megatron's standard all-reduce utility
++            # This uses the same autograd pattern: forward all-reduce, backward pass-through
++            summed_mean_sq = reduce_from_tensor_model_parallel_region(local_mean_sq, group=self.tp_group)
++            # Average to get global mean
++            global_mean_sq = summed_mean_sq / self.tp_size
++        else:
++            global_mean_sq = local_mean_sq
++
++        # Step 3: Compute global RMS inverse for normalization
++        global_rms_inv = torch.rsqrt(global_mean_sq + self.eps)
++
++        # Step 4: Apply normalization with sharded weights
++        output = self._apply_normalization(x, global_rms_inv)
++
++        # Reshape back if needed
++        if needs_reshape:
++            output = output.reshape(input_shape)
++
++        return output
++
++    def sharded_state_dict(
++        self,
++        prefix: str = "",
++        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
++        metadata: Optional[dict] = None,
++    ) -> ShardedStateDict:
++        """
++        Create sharded state dict for distributed checkpointing.
++
++        The weight parameter is sharded across TP ranks along axis 0,
++        so we mark it appropriately for resharding during checkpoint loading.
++        """
++        state_dict = self.state_dict(prefix="", keep_vars=True)
++        return make_sharded_tensors_for_checkpoint(
++            state_dict, prefix, {"weight": 0}, sharded_offsets
++        )
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index 6f557e1f..93bc6f65 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -173,6 +173,11 @@ class TransformerConfig(ModelParallelConfig):
+     qk_layernorm: bool = False
+     """Whether to apply `normalization` type of normalization to the query and key embeddings."""
+ 
++    qk_layernorm_unshare: bool = False # From TUFA patch
++
++    post_self_attn_layernorm: bool = False
++    post_mlp_layernorm: bool = False
++
+     test_mode: bool = False
+     """Whether to run real-time tests."""
+ 
+diff --git a/megatron/core/transformer/transformer_layer.py b/megatron/core/transformer/transformer_layer.py
+index 84f22bde..b4807d26 100644
+--- a/megatron/core/transformer/transformer_layer.py
++++ b/megatron/core/transformer/transformer_layer.py
+@@ -224,6 +224,7 @@ class TransformerLayerSubmodules:
+     input_layernorm: Union[ModuleSpec, type] = IdentityOp
+     self_attention: Union[ModuleSpec, type] = IdentityOp
+     self_attn_bda: Union[ModuleSpec, type] = IdentityFuncOp
++    post_self_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
+ 
+     pre_cross_attn_layernorm: Union[ModuleSpec, type] = IdentityOp
+     cross_attention: Union[ModuleSpec, type] = IdentityOp
+@@ -232,6 +233,7 @@ class TransformerLayerSubmodules:
+     pre_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
+     mlp: Union[ModuleSpec, type] = IdentityOp
+     mlp_bda: Union[ModuleSpec, type] = IdentityFuncOp
++    post_mlp_layernorm: Union[ModuleSpec, type] = IdentityOp
+ 
+     # Mapping for sharded tensor keys to be applied in `sharded_state_dict` method
+     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
+@@ -336,6 +338,14 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
+         # [Module 3: BiasDropoutFusion]
+         self.self_attn_bda = build_module(submodules.self_attn_bda)
+ 
++        self.post_self_attn_layernorm = build_module(
++            submodules.post_self_attn_layernorm,
++            config=self.config,
++            hidden_size=self.config.hidden_size,
++            eps=self.config.layernorm_epsilon,
++        )
++
++
+         # [Module 4: Post SelfAttention] Optional Layernorm after self-attn
+         self.pre_cross_attn_layernorm = build_module(
+             submodules.pre_cross_attn_layernorm,
+@@ -399,6 +409,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
+         # [Module 9: BiasDropoutFusion]
+         self.mlp_bda = build_module(submodules.mlp_bda)
+ 
++        self.post_mlp_layernorm = build_module(
++            submodules.post_mlp_layernorm,
++            config=self.config,
++            hidden_size=self.config.hidden_size,
++            eps=self.config.layernorm_epsilon
++        )
++
+         self.recompute_input_layernorm = False
+         self.recompute_pre_mlp_layernorm = False
+         self.recompute_mlp = False
+@@ -535,6 +552,11 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
+                 attention_output_with_bias[0]
+             )
+ 
++        attention_output, attention_output_bias = attention_output_with_bias
++        attention_output = self.post_self_attn_layernorm(attention_output)
++        attention_output_with_bias = (attention_output, attention_output_bias)
++
++
+         # TODO: could we move `bias_dropout_add_exec_handler` itself
+         # inside the module provided in the `bias_dropout_add_spec` module?
+         nvtx_range_push(suffix="self_attn_bda")
+@@ -635,6 +657,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
+         else:
+             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+ 
++        mlp_output, mlp_output_bias = mlp_output_with_bias
++        mlp_output = self.post_mlp_layernorm(mlp_output)
++        mlp_output_with_bias = (mlp_output, mlp_output_bias)
++
+         if self.recompute_pre_mlp_layernorm:
+             # discard the output of the pre-mlp layernorm and register the recompute
+             # as a gradient hook of mlp_output_with_bias[0]
+diff --git a/megatron/training/arguments.py b/megatron/training/arguments.py
+index 24ba8926..596fc503 100644
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -1191,6 +1191,10 @@ def core_transformer_config_from_args(args, config_class=None):
+     if args.is_hybrid_model:
+         kw_args['is_hybrid_model'] = args.is_hybrid_model
+ 
++    kw_args['post_self_attn_layernorm'] = args.post_self_attn_layernorm
++    kw_args['post_mlp_layernorm'] = args.post_mlp_layernorm
++    kw_args['qk_layernorm_unshare'] = args.qk_layernorm_unshare # From TUFA patch
++
+     # handle quantization config
+     # NOTE: Kitchen arguments are only added to the namespace when
+     # Kitchen library is available.
+@@ -1481,6 +1485,11 @@ def _add_network_size_args(parser):
+                        action='store_true',
+                        help='If set, use original BERT residula connection '
+                        'ordering.')
++    group.add_argument('--post-self-attn-layernorm', action='store_true',
++                       help='If set, use post self attention layernorm.')
++    group.add_argument('--post-mlp-layernorm', action='store_true',
++                       help='If set, use post MLP layernorm.')
++    group.add_argument('--qk-layernorm-unshare', action='store_true')
+     group.add_argument('--openai-gelu', action='store_true',
+                        help='Use OpenAIs GeLU implementation. This option'
+                        'should not be used unless for backward compatibility'

@@ -9,6 +9,7 @@ from .glm4 import convert_glm4_to_hf
 from .glm4moe import convert_glm4moe_to_hf
 from .llama import convert_llama_to_hf
 from .mimo import convert_mimo_to_hf
+from .olmo2 import convert_olmo2_to_hf
 from .qwen2 import convert_qwen2_to_hf
 from .qwen3moe import convert_qwen3moe_to_hf
 
@@ -116,6 +117,8 @@ def convert_to_hf(args, model_name, name, param, quantization_config=None):
         converted_named_tensors = convert_qwen3moe_to_hf(args, name, param)
     elif "qwen2" in model_name or "qwen3" in model_name:
         converted_named_tensors = convert_qwen2_to_hf(args, name, param)
+    elif "olmo2" in model_name.lower():
+        converted_named_tensors = convert_olmo2_to_hf(args, name, param)
     elif "deepseekv3" in model_name:
         converted_named_tensors = convert_deepseekv3_to_hf(args, name, param)
         # to compatible with sglang implementation
