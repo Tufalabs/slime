@@ -65,11 +65,11 @@ def init_wandb_primary(args):
         init_kwargs["dir"] = args.wandb_dir
         print(f"W&B logs will be stored in: {args.wandb_dir}")
 
-    wandb.init(**init_kwargs)
+    run = wandb.init(**init_kwargs)
 
     _init_wandb_common()
 
-    return wandb.run.id
+    return run
 
 
 # https://docs.wandb.ai/guides/track/log/distributed-training/#track-all-processes-to-a-single-run
