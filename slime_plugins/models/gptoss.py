@@ -34,12 +34,12 @@ def get_gptoss_layer_spec(
     spec = ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=backend.layer_norm(),
+            input_layernorm=IdentityOp,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
                 submodules=SelfAttentionSubmodules(
-                    linear_qkv=backend.column_parallel_linear(),
+                    linear_qkv=backend.column_parallel_layer_norm_linear(),
                     core_attention=backend.core_attention(),
                     linear_proj=backend.row_parallel_linear(),
                     q_layernorm=IdentityOp,
