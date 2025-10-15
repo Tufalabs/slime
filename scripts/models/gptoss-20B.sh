@@ -1,7 +1,5 @@
 # GPT-OSS 20B Model Configuration
-# Based on OpenAI's GPT-OSS architecture with 24 layers and 32 experts
 
-# gptoss-20B
 MODEL_ARGS=(
     --spec "slime_plugins.models.gptoss" "get_gptoss_spec"
 
@@ -13,13 +11,14 @@ MODEL_ARGS=(
     --group-query-attention
     --ffn-hidden-size 2880
     --kv-channels 64
-    --normalization RMSNorm
+    --normalization "RMSNorm"
     --untie-embeddings-and-output-weights
     --vocab-size 201088
     --hidden-dropout 0.0
     --attention-dropout 0.0
 
-    # Position embeddings (Rest is hooked into config object)
+    # Position embeddings (Yarn params are hooked into the config object)
+    --position-embedding-type "rope"
     --rotary-base 150000
 
     # MoE configuration
@@ -32,7 +31,7 @@ MODEL_ARGS=(
     --moe-router-load-balancing-type "none"
     --seq-length 131072
     --window-size "128,0"
-    --softmax-type learnable
+    --softmax-type "learnable"
     --quick-geglu
     --glu-linear-offset 1.0
     --window-attn-skip-freq 2

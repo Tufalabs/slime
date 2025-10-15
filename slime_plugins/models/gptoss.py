@@ -3,17 +3,12 @@ from typing import Optional
 import transformer_engine as te  # pylint: disable=unused-import
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_mlp_module_spec_for_backend,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec_for_backend
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_layer import (
-    TransformerLayer,
-    TransformerLayerSubmodules,
-)
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 
 def get_gptoss_layer_spec(
